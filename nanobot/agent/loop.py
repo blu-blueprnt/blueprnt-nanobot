@@ -17,6 +17,7 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.email import EmailReadTool, EmailSendTool, EmailIntegrationsTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
@@ -132,6 +133,11 @@ class AgentLoop:
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
+        # Blueprnt API email tools
+        self.tools.register(EmailReadTool())
+        self.tools.register(EmailSendTool())
+        self.tools.register(EmailIntegrationsTool())
+
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
         if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
@@ -184,22 +190,34 @@ class AgentLoop:
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
-        """Run the agent iteration loop."""
+        """Run the agent iteration loop with streaming support.
+
+        When on_progress is provided and the provider supports chat_stream(),
+        the final (non-tool-call) response is streamed token-by-token via
+        on_progress callbacks. Tool-call iterations use non-streaming calls.
+        """
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        can_stream = hasattr(self.provider, "chat_stream") and on_progress is not None
 
         while iteration < self.max_iterations:
             iteration += 1
 
             tool_defs = self.tools.get_definitions()
 
-            response = await self.provider.chat_with_retry(
-                messages=messages,
-                tools=tool_defs,
-                model=self.model,
-            )
+            if can_stream:
+                # Use streaming — yields str deltas then a final LLMResponse
+                response = await self._run_streaming_call(
+                    messages, tool_defs, on_progress,
+                )
+            else:
+                response = await self.provider.chat_with_retry(
+                    messages=messages,
+                    tools=tool_defs,
+                    model=self.model,
+                )
 
             if response.has_tool_calls:
                 if on_progress:
@@ -251,6 +269,51 @@ class AgentLoop:
             )
 
         return final_content, tools_used, messages
+
+    async def _run_streaming_call(
+        self,
+        messages: list[dict],
+        tool_defs: list[dict],
+        on_progress: Callable[..., Awaitable[None]],
+    ):
+        """Execute a single LLM call with streaming, sending deltas via on_progress.
+
+        Returns the final LLMResponse (with tool calls and/or full content).
+        """
+        from nanobot.providers.base import LLMResponse
+
+        stream = self.provider.chat_stream(
+            messages=messages,
+            tools=tool_defs,
+            model=self.model,
+            max_tokens=self.provider.generation.max_tokens,
+            temperature=self.provider.generation.temperature,
+            reasoning_effort=self.provider.generation.reasoning_effort,
+        )
+
+        response: LLMResponse | None = None
+        streamed_any_text = False
+
+        try:
+            async for item in stream:
+                if isinstance(item, str):
+                    # Text delta — stream it to the channel
+                    if item:
+                        streamed_any_text = True
+                        await on_progress(item, stream_delta=True)
+                elif isinstance(item, LLMResponse):
+                    response = item
+        except Exception as e:
+            logger.error("Streaming call failed: {}", e)
+            return LLMResponse(
+                content=f"Error calling LLM: {e}",
+                finish_reason="error",
+            )
+
+        if response is None:
+            return LLMResponse(content=None, finish_reason="error")
+
+        return response
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -426,10 +489,21 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
         )
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+        _streamed_final = False
+        # Only use streaming for HTTP API channel — other channels (Telegram,
+        # Discord, etc.) handle their own streaming/typing simulation.
+        _enable_stream = msg.channel == "http_api"
+
+        async def _bus_progress(content: str, *, tool_hint: bool = False, stream_delta: bool = False) -> None:
+            nonlocal _streamed_final
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
+            if stream_delta and _enable_stream:
+                meta["_stream_delta"] = True
+                _streamed_final = True
+            elif stream_delta:
+                return  # Skip individual token deltas for non-HTTP channels
             await self.bus.publish_outbound(OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
@@ -447,6 +521,18 @@ class AgentLoop:
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
+
+        # If we already streamed the response token-by-token, send a final
+        # empty message (without _progress) so the HTTP channel's sentinel
+        # logic closes the SSE stream.
+        if _streamed_final:
+            logger.info("Response streamed to {}:{} ({} chars)", msg.channel, msg.sender_id, len(final_content or ""))
+            meta = dict(msg.metadata or {})
+            meta["_stream_done"] = True
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content="",
+                metadata=meta,
+            )
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)

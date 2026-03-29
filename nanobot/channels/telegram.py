@@ -319,6 +319,10 @@ class TelegramChannel(BaseChannel):
             logger.warning("Telegram bot not running")
             return
 
+        # Stream deltas are for HTTP SSE only — skip in Telegram
+        if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_done"):
+            return
+
         # Only stop typing indicator for final responses
         if not msg.metadata.get("_progress", False):
             self._stop_typing(msg.chat_id)

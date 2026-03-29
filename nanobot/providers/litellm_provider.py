@@ -4,7 +4,7 @@ import hashlib
 import os
 import secrets
 import string
-from typing import Any
+from typing import Any, AsyncIterator
 
 import json_repair
 import litellm
@@ -283,6 +283,145 @@ class LiteLLMProvider(LLMProvider):
         except Exception as e:
             # Return error as content for graceful handling
             return LLMResponse(
+                content=f"Error calling LLM: {str(e)}",
+                finish_reason="error",
+            )
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> AsyncIterator[str | LLMResponse]:
+        """
+        Stream a chat completion via LiteLLM.
+
+        Yields str deltas as they arrive from the provider. After the stream
+        completes, yields a final LLMResponse with the full content, tool
+        calls, usage, etc.
+
+        If the response contains tool calls, falls back to non-streaming
+        (tool call deltas are complex to reassemble) and yields the full
+        LLMResponse directly.
+        """
+        original_model = model or self.default_model
+        model = self._resolve_model(original_model)
+        extra_msg_keys = self._extra_msg_keys(original_model, model)
+
+        if self._supports_cache_control(original_model):
+            messages, tools = self._apply_cache_control(messages, tools)
+
+        max_tokens = max(1, max_tokens)
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": self._sanitize_messages(
+                self._sanitize_empty_content(messages), extra_keys=extra_msg_keys
+            ),
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+        }
+
+        if self._gateway:
+            kwargs.update(self._gateway.litellm_kwargs)
+
+        self._apply_model_overrides(model, kwargs)
+
+        if self._langsmith_enabled:
+            kwargs.setdefault("callbacks", []).append("langsmith")
+
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+        if self.extra_headers:
+            kwargs["extra_headers"] = self.extra_headers
+
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+            kwargs["drop_params"] = True
+
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice or "auto"
+
+        try:
+            response = await acompletion(**kwargs)
+
+            full_content = ""
+            tool_calls_raw: list[dict] = []
+            finish_reason = "stop"
+            usage = {}
+            reasoning_content = ""
+
+            async for chunk in response:
+                choice = chunk.choices[0] if chunk.choices else None
+                if not choice:
+                    continue
+
+                delta = choice.delta
+
+                # Text content
+                if delta and delta.content:
+                    full_content += delta.content
+                    yield delta.content
+
+                # Reasoning content (DeepSeek, etc.)
+                if delta and getattr(delta, "reasoning_content", None):
+                    reasoning_content += delta.reasoning_content
+
+                # Tool calls — accumulate deltas
+                if delta and delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index if hasattr(tc_delta, "index") else 0
+                        while len(tool_calls_raw) <= idx:
+                            tool_calls_raw.append({"id": "", "name": "", "arguments": ""})
+                        if tc_delta.id:
+                            tool_calls_raw[idx]["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                tool_calls_raw[idx]["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                tool_calls_raw[idx]["arguments"] += tc_delta.function.arguments
+
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+
+                # Usage from stream (some providers include it in the last chunk)
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage = {
+                        "prompt_tokens": chunk.usage.prompt_tokens,
+                        "completion_tokens": chunk.usage.completion_tokens,
+                        "total_tokens": chunk.usage.total_tokens,
+                    }
+
+            # Build tool calls
+            parsed_tool_calls = []
+            for tc_raw in tool_calls_raw:
+                args = tc_raw["arguments"]
+                if isinstance(args, str):
+                    args = json_repair.loads(args) if args else {}
+                parsed_tool_calls.append(ToolCallRequest(
+                    id=tc_raw["id"] or _short_tool_id(),
+                    name=tc_raw["name"],
+                    arguments=args,
+                ))
+
+            yield LLMResponse(
+                content=full_content or None,
+                tool_calls=parsed_tool_calls,
+                finish_reason=finish_reason,
+                usage=usage,
+                reasoning_content=reasoning_content or None,
+            )
+
+        except Exception as e:
+            yield LLMResponse(
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
